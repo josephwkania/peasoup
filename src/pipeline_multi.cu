@@ -3,6 +3,7 @@
 #include <data_types/header.hpp>
 #include <data_types/candidates.hpp>
 #include <data_types/filterbank.hpp>
+#include <data_types/series_file.hpp>
 #include <transforms/dedisperser.hpp>
 #include <transforms/resampler.hpp>
 #include <transforms/folder.hpp>
@@ -693,8 +694,19 @@ int main(int argc, char **argv)
   if (args.verbose)
     std::cout << "Generating DM list" << std::endl;
   std::vector<float> full_dm_list;
+  std::optional<SeriesFile> series;
 
-  if (args.dm_file=="none") {
+  if (args.series_file != "") {
+    // The series were dedispersed already (heimdall -series_file)
+    series.emplace(args.series_file);
+    full_dm_list = series->get_dm_list();
+    if (std::fabs(series->get_tsamp() - filobj.get_tsamp()) > 1e-6 * filobj.get_tsamp())
+      ErrorChecker::throw_error("The series file's tsamp differs from the filterbank's");
+    std::cout << "Reading " << full_dm_list.size() << " dedispersed series of "
+              << series->get_nsamps() << " samples in " << series->get_block_count()
+              << " blocks from " << args.series_file << std::endl;
+  }
+  else if (args.dm_file=="none") {
     Dedisperser dedisperser(filobj, nthreads);
     dedisperser.generate_dm_list(args.dm_start, args.dm_end, args.dm_pulse_width, args.dm_tol);
     full_dm_list = dedisperser.get_dm_list();
@@ -718,14 +730,16 @@ int main(int argc, char **argv)
     std::size_t end   = (idx + ndm_trial_gulp) > full_dm_list.size() ? full_dm_list.size(): (idx + ndm_trial_gulp) ;
     if(args.verbose) std::cout << "Gulp start: " << start << " end: " << end << std::endl;
     std::vector<float> dm_list_chunk(full_dm_list.begin() + start,  full_dm_list.begin() + end);
-    Dedisperser dedisperser(filobj, nthreads);
+    std::optional<Dedisperser> dedisperser;
+    if (!series) {
+    dedisperser.emplace(filobj, nthreads);
     if (args.killfilename!=""){
       if (args.verbose)
         std::cout << "Using killfile: " << args.killfilename << std::endl;
-      dedisperser.set_killmask(args.killfilename);
+      dedisperser->set_killmask(args.killfilename);
     }
 
-    dedisperser.set_dm_list(dm_list_chunk);
+    dedisperser->set_dm_list(dm_list_chunk);
 
     if (args.verbose){
     std::cout << dm_list_chunk.size() << " DM trials" << std::endl;
@@ -735,10 +749,15 @@ int main(int argc, char **argv)
     }
     std::cout << "Executing dedispersion" << std::endl;
     }
+    }
 
     timers["dedispersion"].start();
     PUSH_NVTX_RANGE("Dedisperse",3)
     DispersionTrials<DedispOutputType> trials(filobj.get_tsamp());
+    if (series) {
+    std::cout <<"loading dedispersed series...." <<std::endl;
+    series->load(trials, start, end);
+    } else {
     std::cout <<"dedispersing...." <<std::endl;
 
     std::size_t gulp_size;
@@ -751,7 +770,8 @@ int main(int argc, char **argv)
       std::cout<< "Starting to dedisperse filterbank from Sample:" << filobj.get_start_sample() 
             << " to " << filobj.get_end_sample() << " samples, with gulp size of " << gulp_size << " samples" << std::endl;
     }
-    dedisperser.dedisperse(trials, filobj.get_start_sample(), filobj.get_end_sample(), gulp_size);
+    dedisperser->dedisperse(trials, filobj.get_start_sample(), filobj.get_end_sample(), gulp_size);
+    }
     POP_NVTX_RANGE
     //trials.set_nsamps(size);
     timers["dedispersion"].stop();

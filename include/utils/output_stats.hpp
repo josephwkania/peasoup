@@ -101,6 +101,7 @@ public:
     search_options.append(XML::Element("max_num_threads",args.max_num_threads));
     search_options.append(XML::Element("size",args.size));
     search_options.append(XML::Element("dmfilename",args.dm_file));
+    search_options.append(XML::Element("series_file",args.series_file));
     search_options.append(XML::Element("cdm",format_float_to_precision(args.cdm, 4)));
     search_options.append(XML::Element("dm_start",args.dm_start));
     search_options.append(XML::Element("dm_end",args.dm_end));

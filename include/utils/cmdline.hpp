@@ -16,6 +16,7 @@ struct CmdLineOptions {
   float dm_tol;
   float dm_pulse_width;
   std::string dm_file;
+  std::string series_file;
   int dedisp_gulp;
   float host_ram_limit_gb;
   float acc_start;
@@ -116,6 +117,9 @@ bool read_cmdline_options(CmdLineOptions& args, int argc, char **argv)
       TCLAP::ValueArg<std::string> arg_dm_file("", "dm_file",
                                           "filename with dm list",
                                           false, "none", "string", cmd);
+      TCLAP::ValueArg<std::string> arg_series_file("", "series_file",
+                                          "Search the dedispersed series in this file (from heimdall -series_file) instead of dedispersing; its DM list replaces --dm_file and --dm_start/end",
+                                          false, "", "string", cmd);
       TCLAP::ValueArg<float> arg_cdm("", "cdm",
                                           "Coherent DM of filterbank file",
                                           false, 0.0, "float", cmd);
@@ -233,6 +237,7 @@ bool read_cmdline_options(CmdLineOptions& args, int argc, char **argv)
       args.limit             = arg_limit.getValue();
       args.size              = arg_size.getValue();
       args.dm_file           = arg_dm_file.getValue();
+      args.series_file       = arg_series_file.getValue();
       args.cdm               = arg_cdm.getValue();
       args.dm_end            = arg_dm_end.getValue();
       args.dm_start          = arg_dm_start.getValue();
