@@ -34,6 +34,10 @@
 #include <cmath>
 #include <filesystem>
 #include <map>
+#include <memory>
+#include <climits>
+#include <algorithm>
+#include <utility>
 #include <optional>
 #include <thrust/host_vector.h>
 #include <thrust/sequence.h>
@@ -76,6 +80,52 @@ public:
   }
 };
 
+// The distillers' fractional frequency tolerance for a window of WINDOW_SIZE
+// samples, from the whole series' (SIZE samples): the same in Fourier bins
+static float window_freq_tol(float freq_tol, unsigned int size, unsigned int window_size){
+  return freq_tol * (float)size / (float)window_size;
+}
+
+// One searched span of each DM trial: the whole series (window -1) or one
+// window of it, with its own FFTs, whitening, peak finding and candidates.
+struct Scale {
+  unsigned int size;   // FFT length
+  std::size_t start;   // first sample
+  int window;          // index among the windows, -1 for the whole series
+  AccelerationPlan& acc_plan;
+  CuFFTerR2C r2cfft;
+  CuFFTerC2R c2rfft;
+  DeviceFourierSeries<cufftComplex> d_fseries;
+  ReusableDeviceTimeSeries<float, DedispOutputType> d_tim;
+  DeviceTimeSeries<float> d_tim_resampled;
+  DevicePowerSpectrum<float> d_pspec;
+  Dereddener rednoise;
+  SpectrumFormer former;
+  PeakFinder cand_finder;
+  HarmonicSums<float> sums;
+  HarmonicFolder harm_folder;
+  HarmonicDistiller harm_finder;
+  AccelerationDistiller acc_still;
+  float mean, std, rms;
+
+  // FREQ_TOL: the fractional tolerance of the distillers, args.freq_tol for the
+  // whole series and that times its length over a window's for a window, so
+  // that it spans the same number of Fourier bins
+  Scale(unsigned int size, std::size_t start, int window, AccelerationPlan& acc_plan,
+        CmdLineOptions& args, float tsamp, float freq_tol)
+    :size(size), start(start), window(window), acc_plan(acc_plan),
+     r2cfft(size), c2rfft(size),
+     d_fseries(size/2+1, 1.0/(size*tsamp)),
+     d_tim(size), d_tim_resampled(size), d_pspec(d_fseries),
+     rednoise(size/2+1),
+     cand_finder(args.min_snr,args.min_freq,args.max_freq,size),
+     sums(d_pspec,args.nharmonics),
+     harm_folder(sums, args.single_precision_harmonic_sums),
+     harm_finder(freq_tol,args.max_harm,false),
+     acc_still(size*tsamp,freq_tol,true),
+     mean(0), std(0), rms(0) {}
+};
+
 class Worker {
 private:
   DispersionTrials<DedispOutputType>& trials;
@@ -88,9 +138,40 @@ private:
   std::map<std::string,Stopwatch> timers;
   std::optional<Keplerian_TemplateBank_Reader>& keplerian_tb;
   bool elliptical_orbit_search;
+  const std::vector<std::size_t>& window_starts;
+  unsigned int window_size;
+  AccelerationPlan* window_acc_plan;
+  std::size_t dm_offset; // index of this gulp's first DM trial in the full DM list
+  std::vector<std::unique_ptr<Scale>> scales; // the whole series, then each window
+  std::unique_ptr<Zapper> bzap;
+
+  void prepare(void){
+    if (!scales.empty())
+      return;
+    float tsamp = trials.get_tsamp();
+    scales.emplace_back(new Scale(size, 0, -1, acc_plan, args, tsamp, args.freq_tol));
+    for (std::size_t w = 0; w < window_starts.size(); ++w)
+      scales.emplace_back(new Scale(window_size, window_starts[w], (int)w, *window_acc_plan, args, tsamp,
+                                    window_freq_tol(args.freq_tol, size, window_size)));
+    if (!args.zapfilename.empty()) {
+      if (args.verbose)
+        std::cout << "Using zapfile: " << args.zapfilename << "\n";
+      bzap.reset(new Zapper(args.zapfilename));
+    }
+  }
+
+  // The samples of TIM a scale searches
+  void scale_view(Scale& s, DedispersedTimeSeries<DedispOutputType>& tim,
+                  DedispersedTimeSeries<DedispOutputType>& view){
+    std::size_t n = tim.get_nsamps() > s.start ? tim.get_nsamps() - s.start : 0;
+    view.set_data(tim.get_data() + s.start);
+    view.set_nsamps(std::min<std::size_t>(n, s.size));
+    view.set_tsamp(tim.get_tsamp());
+    view.set_dm(tim.get_dm());
+  }
 
   void preprocess_time_series(DedispersedTimeSeries<DedispOutputType>& tim,
-    ReusableDeviceTimeSeries<float, DedispOutputType>& d_tim) {
+    ReusableDeviceTimeSeries<float, DedispOutputType>& d_tim, unsigned int size) {
         if (args.verbose) {
             std::cout << "Copying time series to device (DM=" << tim.get_dm() << ")\n";
             std::cout << "Transferring " << tim.get_nsamps() << " samples\n";
@@ -116,7 +197,7 @@ private:
     Dereddener& rednoise,
     Zapper* bzap,
     SpectrumFormer& former,
-    float& mean, float& rms, float& std) {
+    float& mean, float& rms, float& std, unsigned int size) {
 
     if (args.verbose) std::cout << "Executing forward FFT\n";
     r2cfft.execute(d_tim.get_data(), d_fseries.get_data());
@@ -199,7 +280,7 @@ void run_acceleration_search(int idx,
     HarmonicFolder& harm_folder,
     PeakFinder& cand_finder,
     HarmonicDistiller& harm_finder,
-    float mean, float std, unsigned int size
+    float mean, float std, unsigned int size, bool tick = true
 )
 {
     if (args.verbose) std::cout << "Generating acceleration list\n";
@@ -218,7 +299,7 @@ void run_acceleration_search(int idx,
             sums, harm_folder, cand_finder, harm_finder, trial_cands,
             accel_search_cands, mean, std, size);
         // Update progress bar
-        if (prog) prog->tick_bin(); 
+        if (prog && tick) prog->tick_bin(); 
     }
     POP_NVTX_RANGE
 }
@@ -435,6 +516,7 @@ void run_keplerian_search(int idx,
 
 public:
   CandidateCollection dm_trial_cands;
+  std::vector<std::vector<Candidate>> window_trial_cands; // per window
 
   inline void find_min_max(thrust::device_vector<double> &dev_vec, double *min, double *max){
     thrust::pair<thrust::device_vector<double>::iterator,thrust::device_vector<double>::iterator> tuple;
@@ -445,7 +527,9 @@ public:
 
   Worker(DispersionTrials<DedispOutputType>& trials, DMDispenser& manager,
 	 AccelerationPlan& acc_plan, CmdLineOptions& args, unsigned int size, int device, ProgressMonitor* prog,
-         std::optional<Keplerian_TemplateBank_Reader>& keplerian_tb, bool elliptical_orbit_search)
+         std::optional<Keplerian_TemplateBank_Reader>& keplerian_tb, bool elliptical_orbit_search,
+         const std::vector<std::size_t>& window_starts, unsigned int window_size,
+         AccelerationPlan* window_acc_plan, std::size_t dm_offset)
     :trials(trials)
     ,manager(manager)
     ,acc_plan(acc_plan)
@@ -455,6 +539,10 @@ public:
     ,prog(prog)
     ,keplerian_tb(keplerian_tb)
     ,elliptical_orbit_search(elliptical_orbit_search)  
+    ,window_starts(window_starts)
+    ,window_size(window_size)
+    ,window_acc_plan(window_acc_plan)
+    ,dm_offset(dm_offset)
   {}
 
   void start(void)
@@ -464,24 +552,9 @@ public:
     Stopwatch pass_timer;
     pass_timer.start();
 
-    CuFFTerR2C r2cfft(size);
-    CuFFTerC2R c2rfft(size);
-    float tobs = size*trials.get_tsamp();
-    float bin_width = 1.0/tobs;
     double tsamp = trials.get_tsamp();
     double inverse_tsamp = 1.0 / tsamp;
-    DeviceFourierSeries<cufftComplex> d_fseries(size/2+1,bin_width);
-    DedispersedTimeSeries<DedispOutputType> tim;
-    ReusableDeviceTimeSeries<float, DedispOutputType> d_tim(size);
-    DeviceTimeSeries<float> d_tim_resampled(size);
-    DevicePowerSpectrum<float> d_pspec(d_fseries);
-    Dereddener rednoise(size/2+1);
-    SpectrumFormer former;
-    PeakFinder cand_finder(args.min_snr,args.min_freq,args.max_freq,size);
-    HarmonicSums<float> sums(d_pspec,args.nharmonics);
-    HarmonicFolder harm_folder(sums, args.single_precision_harmonic_sums);
-    HarmonicDistiller harm_finder(args.freq_tol,args.max_harm,false);
-    float mean,std,rms;
+    DedispersedTimeSeries<DedispOutputType> tim, view;
     int idx;
 
     if(args.single_precision_harmonic_sums){
@@ -490,29 +563,26 @@ public:
         if (args.verbose) std::cout << "Using double precision harmonic sums\n";
     }
     
-    
-
-    // Set up zapper if requested
-    Zapper* bzap = nullptr; 
-    if (!args.zapfilename.empty()) {            
-        if (args.verbose) 
-          std::cout << "Using zapfile: " << args.zapfilename << "\n";
-        bzap = new Zapper(args.zapfilename);     
-      }
-    
+    prepare();
+    window_trial_cands.assign(window_starts.size(), std::vector<Candidate>());
     std::vector<float> acc_list;
-    AccelerationDistiller acc_still(tobs,args.freq_tol,true);
-
-
 
 	PUSH_NVTX_RANGE("DM-Loop",0)
     while (true) {
         idx = manager.get_dm_trial_idx();
         trials.get_idx(idx, tim, size);
         if (idx == -1) break;
+        int dm_idx = idx + (int)dm_offset;
+        for (std::unique_ptr<Scale>& sp : scales) {
+        Scale& s = *sp;
+        const bool full = s.window < 0;
+        DedispersedTimeSeries<DedispOutputType>& in = full ? tim : view;
+        if (!full)
+            scale_view(s, tim, view);
         //Start processing
-        preprocess_time_series(tim, d_tim);
-        remove_rednoise_and_zap(d_tim, r2cfft, c2rfft, d_fseries, d_pspec, rednoise, bzap, former, mean, rms, std);
+        preprocess_time_series(in, s.d_tim, s.size);
+        remove_rednoise_and_zap(s.d_tim, s.r2cfft, s.c2rfft, s.d_fseries, s.d_pspec, s.rednoise, bzap.get(),
+                                s.former, s.mean, s.rms, s.std, s.size);
 
         if (keplerian_tb) {
             
@@ -522,9 +592,9 @@ public:
             CandidateCollection keplerian_search_cands;
            
             run_keplerian_search(
-                idx, *keplerian_tb, keplerian_search_cands, tim, d_tim, d_tim_resampled,
-                r2cfft, c2rfft, d_fseries, d_pspec, former, sums, harm_folder,
-                cand_finder, harm_finder, mean, std, size, tsamp, inverse_tsamp);
+                dm_idx, *keplerian_tb, keplerian_search_cands, tim, s.d_tim, s.d_tim_resampled,
+                s.r2cfft, s.c2rfft, s.d_fseries, s.d_pspec, s.former, s.sums, s.harm_folder,
+                s.cand_finder, s.harm_finder, s.mean, s.std, s.size, tsamp, inverse_tsamp);
             
             if (args.distill_circular_orbit_cands) {
                 if (args.verbose) std::cout << "Distilling circular orbit candidates\n";
@@ -542,21 +612,79 @@ public:
             
             // Acceleration search only
             run_acceleration_search(
-                idx, acc_plan, accel_search_cands, acc_list, tim, d_tim, d_tim_resampled, r2cfft, c2rfft,
-                d_fseries, d_pspec, former, sums, harm_folder, cand_finder,
-                harm_finder, mean, std, size);
+                dm_idx, s.acc_plan, accel_search_cands, acc_list, in, s.d_tim, s.d_tim_resampled, s.r2cfft, s.c2rfft,
+                s.d_fseries, s.d_pspec, s.former, s.sums, s.harm_folder, s.cand_finder,
+                s.harm_finder, s.mean, s.std, s.size, full);
 
             if (args.verbose) std::cout << "Distilling accelerations" << std::endl;
-            dm_trial_cands.append(acc_still.distill(accel_search_cands.cands));
+            if (full) {
+                dm_trial_cands.append(s.acc_still.distill(accel_search_cands.cands));
+            } else {
+                std::vector<Candidate> kept = s.acc_still.distill(accel_search_cands.cands);
+                for (Candidate& c : kept)
+                    c.window = s.window;
+                std::vector<Candidate>& out = window_trial_cands[s.window];
+                out.insert(out.end(), kept.begin(), kept.end());
+            }
+        }
         }
     }
 	POP_NVTX_RANGE
 
-    if (args.zapfilename!="")
-      delete bzap;
-
     if (args.verbose)
       std::cout << "DM processing took " << pass_timer.getTime() << " seconds"<< std::endl;
+  }
+
+  // The light curves of CANDS, all of DM trial IDX: in every scale, the
+  // largest value of each one's harmonic sum within one Fourier bin of its
+  // frequency, after resampling to its acceleration (full_snr, window_snr).
+  void light_curves(std::size_t idx, std::vector<Candidate*>& cands){
+    cudaSetDevice(device);
+    prepare();
+    DedispersedTimeSeries<DedispOutputType> tim, view;
+    trials.get_idx(idx, tim, size);
+    std::map<float, std::vector<Candidate*>> by_acc;
+    for (Candidate* c : cands) {
+      c->window_snr.assign(window_starts.size(), NAN);
+      by_acc[c->acc].push_back(c);
+    }
+    std::vector<float> values;
+    for (std::unique_ptr<Scale>& sp : scales) {
+      Scale& s = *sp;
+      const bool full = s.window < 0;
+      DedispersedTimeSeries<DedispOutputType>& in = full ? tim : view;
+      if (!full)
+        scale_view(s, tim, view);
+      preprocess_time_series(in, s.d_tim, s.size);
+      remove_rednoise_and_zap(s.d_tim, s.r2cfft, s.c2rfft, s.d_fseries, s.d_pspec, s.rednoise, bzap.get(),
+                              s.former, s.mean, s.rms, s.std, s.size);
+      for (auto& entry : by_acc) {
+        run_acceleration_time_domain_resampler(s.d_tim, s.d_tim_resampled, entry.first, s.size);
+        s.r2cfft.execute(s.d_tim_resampled.get_data(), s.d_fseries.get_data());
+        s.former.form_interpolated(s.d_fseries, s.d_pspec);
+        stats::normalise(s.d_pspec.get_data(), s.mean * s.size, s.std * s.size, s.size / 2 + 1);
+        s.harm_folder.fold(s.d_pspec);
+        for (Candidate* c : entry.second) {
+          if (c->nh < 0 || c->nh > (int)s.sums.size())
+            continue;
+          DevicePowerSpectrum<float>& level = c->nh == 0 ? s.d_pspec : *s.sums[c->nh - 1];
+          const long nbins = level.get_nbins();
+          const long half = 1L << c->nh; // one Fourier bin of this scale
+          const long centre = std::lround(c->freq / level.get_bin_width() * (double)half);
+          const long lo = std::max(0L, centre - half);
+          const long hi = std::min(nbins - 1, centre + half);
+          if (lo > hi)
+            continue;
+          values.resize(hi - lo + 1);
+          Utils::d2hcpy(values.data(), level.get_data() + lo, (unsigned int)values.size());
+          const float best = *std::max_element(values.begin(), values.end());
+          if (full)
+            c->full_snr = best;
+          else
+            c->window_snr[s.window] = best;
+        }
+      }
+    }
   }
 
 };
@@ -598,6 +726,73 @@ bool getFileContent(std::string fileName, std::vector<float> & vecOfDMs)
 
 
 
+// --windows N:HOP
+static void parse_windows(std::string const& spec, std::size_t& nsamps, std::size_t& hop){
+  std::size_t colon = spec.find(':');
+  try {
+    if (colon == std::string::npos)
+      throw std::invalid_argument(spec);
+    nsamps = std::stoull(spec.substr(0, colon));
+    hop = std::stoull(spec.substr(colon + 1));
+  } catch (std::exception&) {
+    ErrorChecker::throw_error("--windows takes N:HOP, two sample counts");
+  }
+  if (nsamps < 2 || (nsamps & (nsamps - 1)) != 0 || hop == 0)
+    ErrorChecker::throw_error("--windows needs N a power of two and HOP > 0");
+}
+
+// The DM trials (lowest, highest index) of a candidate's own signal: itself
+// and its associates at its frequency (the DM distiller's), not the harmonics
+// the harmonic distiller attached.
+static std::pair<int,int> dm_idx_range(Candidate& c, float freq_tol){
+  std::vector<CandidatePOD> all;
+  c.collect_candidates(all);
+  int lo = c.dm_idx, hi = c.dm_idx;
+  for (CandidatePOD const& p : all) {
+    if (std::fabs(p.freq / c.freq - 1.0) <= 2.0 * freq_tol) {
+      lo = std::min(lo, p.dm_idx);
+      hi = std::max(hi, p.dm_idx);
+    }
+  }
+  return {lo, hi};
+}
+
+// Window candidates of one signal: within MERGE_BINS Fourier bins of a
+// window (TOL Hz) and over neighbouring DM trials (gaps of up to
+// MERGE_DM_GAP trials). The strongest is reported, with every window.
+static const double MERGE_BINS = 2.0;
+static const int MERGE_DM_GAP = 2;
+
+static bool same_signal(Candidate& a, std::pair<int,int> ra, Candidate& b, std::pair<int,int> rb, double tol){
+  return std::fabs(a.freq - b.freq) <= tol
+      && ra.first <= rb.second + MERGE_DM_GAP && rb.first <= ra.second + MERGE_DM_GAP;
+}
+
+static std::vector<Candidate> merge_windows(std::vector<Candidate>& cands, double tol, float freq_tol){
+  std::stable_sort(cands.begin(), cands.end(), [](Candidate const& a, Candidate const& b){ return a.snr > b.snr; });
+  std::vector<Candidate> groups;
+  std::vector<std::pair<int,int>> ranges;
+  for (Candidate& c : cands) {
+    std::pair<int,int> rc = dm_idx_range(c, freq_tol);
+    std::size_t g = 0;
+    while (g < groups.size() && !same_signal(groups[g], ranges[g], c, rc, tol))
+      ++g;
+    if (g == groups.size()) {
+      groups.push_back(c);
+      ranges.push_back(rc);
+      continue;
+    }
+    std::vector<int>& w = groups[g].windows;
+    for (int x : c.windows)
+      if (std::find(w.begin(), w.end(), x) == w.end())
+        w.push_back(x);
+    ranges[g] = {std::min(ranges[g].first, rc.first), std::max(ranges[g].second, rc.second)};
+  }
+  for (Candidate& c : groups)
+    std::sort(c.windows.begin(), c.windows.end());
+  return groups;
+}
+
 int main(int argc, char **argv)
 {
   std::map<std::string,Stopwatch> timers;
@@ -629,6 +824,16 @@ int main(int argc, char **argv)
 
  
   if (args.nsamples > 0 && args.size > 0 && args.nsamples > args.size) ErrorChecker::throw_error("nsamples cannot be > fft size.");
+  const bool windowed = !args.windows.empty();
+  std::size_t window_size = 0, window_hop = 0;
+  std::vector<std::size_t> window_starts; // set from the first gulp's series length
+  if (windowed) {
+    parse_windows(args.windows, window_size, window_hop);
+    if (args.keplerian_tb_file != "none")
+      ErrorChecker::throw_error("--windows does not work with a Keplerian template bank");
+    if (args.timeseries_dump_dir != "")
+      ErrorChecker::throw_error("--windows does not work with --timeseries_dump_dir");
+  }
   if (args.size > 0 && args.nsamples == 0){
      args.nsamples =  args.size;
     }  
@@ -673,6 +878,12 @@ int main(int argc, char **argv)
     filobj.get_foff() * 1e6 // from header in MHz needs converted to Hz
     );
  
+
+  // The windows' own acceleration plan, for their FFT length
+  AccelerationPlan window_acc_plan(
+    args.acc_start, args.acc_end, args.acc_tol, args.acc_pulse_width * 1e-6,
+    windowed ? window_size : size, filobj.get_tsamp(), filobj.get_cfreq() * 1e6, filobj.get_foff() * 1e6);
+  std::vector<std::vector<Candidate>> window_cands;
 
   std::optional<Keplerian_TemplateBank_Reader> keplerian_tb;
 
@@ -777,6 +988,15 @@ int main(int argc, char **argv)
     timers["dedispersion"].stop();
     
     std::cout << "Setting FFT length to " << size << " points" << std::endl;
+    if (windowed && window_cands.empty()) {
+      for (std::size_t w0 = 0; w0 + window_size <= trials.get_nsamps(); w0 += window_hop)
+        window_starts.push_back(w0);
+      if (window_starts.empty())
+        ErrorChecker::throw_error("--windows: a window is longer than the series");
+      window_cands.resize(window_starts.size());
+      std::cout << "Searching " << window_starts.size() << " windows of " << window_size
+                << " samples every " << window_hop << " samples as well" << std::endl;
+    }
     std::cout <<"Starting searching..."  << std::endl;
 
     //Multithreading commands
@@ -826,7 +1046,8 @@ int main(int argc, char **argv)
     }
     
     for (int ii=0;ii<nthreads;ii++){
-      workers[ii] = (new Worker(trials,dispenser,acc_plan,args,size,ii,progPtr,keplerian_tb,elliptical_orbit_search));
+      workers[ii] = (new Worker(trials,dispenser,acc_plan,args,size,ii,progPtr,keplerian_tb,elliptical_orbit_search,
+                                window_starts,window_size,&window_acc_plan,start));
       pthread_create(&threads[ii], NULL, launch_worker_thread, (void*) workers[ii]);
     }
 
@@ -836,6 +1057,9 @@ int main(int argc, char **argv)
     for (int ii=0; ii<nthreads; ii++){
       pthread_join(threads[ii],NULL);
       dm_cands.append(workers[ii]->dm_trial_cands.cands);
+      for (std::size_t w = 0; w < window_cands.size(); ++w)
+        window_cands[w].insert(window_cands[w].end(), workers[ii]->window_trial_cands[w].begin(),
+                               workers[ii]->window_trial_cands[w].end());
       delete workers[ii];
     }
     if (progPtr) progPtr->finish(); 
@@ -862,6 +1086,90 @@ int main(int argc, char **argv)
   int new_size = std::min(args.limit,(int) dm_cands.cands.size());
   dm_cands.cands.resize(new_size);
 
+  if (windowed) {
+    // Each window as the whole series is, then one candidate per signal
+    // across the windows
+    timers["windows"] = Stopwatch();
+    timers["windows"].start();
+    std::vector<Candidate> window_found;
+    const float wtol = window_freq_tol(args.freq_tol, size, window_size);
+    for (std::size_t w = 0; w < window_cands.size(); ++w) {
+      DMDistiller dm_still_w(wtol,true);
+      HarmonicDistiller harm_still_w(wtol,args.max_harm,true,false);
+      std::vector<Candidate> found = dm_still_w.distill(window_cands[w]);
+      found = harm_still_w.distill(found);
+      for (Candidate& c : found) {
+        c.window = (int)w;
+        c.windows.assign(1, (int)w);
+        c.in_full = false;
+      }
+      window_found.insert(window_found.end(), found.begin(), found.end());
+    }
+    cand_scorer.score_all(window_found);
+    const double tol = MERGE_BINS / (window_size * filobj.get_tsamp());
+    std::size_t n_window = window_found.size();
+    window_found = merge_windows(window_found, tol, wtol);
+    // A window signal the whole series found too joins that candidate,
+    // which is reported from the more significant of the two
+    std::vector<std::pair<int,int>> full_ranges;
+    for (Candidate& c : dm_cands.cands) {
+      full_ranges.push_back(dm_idx_range(c, args.freq_tol));
+      c.window = -1;
+      c.in_full = true;
+    }
+    std::vector<Candidate> window_only;
+    for (Candidate& wc : window_found) {
+      std::pair<int,int> rw = dm_idx_range(wc, wtol);
+      int best = -1;
+      for (std::size_t i = 0; i < dm_cands.cands.size(); ++i)
+        if (same_signal(dm_cands.cands[i], full_ranges[i], wc, rw, tol)
+            && (best < 0 || dm_cands.cands[i].snr > dm_cands.cands[best].snr))
+          best = (int)i;
+      if (best < 0) {
+        window_only.push_back(wc);
+        continue;
+      }
+      Candidate& fc = dm_cands.cands[best];
+      std::vector<int> windows = fc.windows;
+      for (int x : wc.windows)
+        if (std::find(windows.begin(), windows.end(), x) == windows.end())
+          windows.push_back(x);
+      std::sort(windows.begin(), windows.end());
+      if (wc.snr > fc.snr)
+        fc = wc;
+      fc.windows = windows;
+      fc.in_full = true;
+    }
+    std::stable_sort(dm_cands.cands.begin(), dm_cands.cands.end(),
+                     [](Candidate const& a, Candidate const& b){ return a.snr > b.snr; });
+    if ((int)window_only.size() > args.limit)
+      window_only.resize(args.limit);
+    std::cout << n_window << " window candidates are " << window_found.size() << " signals; "
+              << window_found.size() - window_only.size() << " joined whole-series candidates, "
+              << window_only.size() << " kept as window candidates" << std::endl;
+    dm_cands.cands.insert(dm_cands.cands.end(), window_only.begin(), window_only.end());
+
+    // Light curves, from the series file
+    if (series && !args.no_light_curves) {
+      std::map<int, std::vector<Candidate*>> by_dm;
+      for (Candidate& c : dm_cands.cands)
+        by_dm[c.dm_idx].push_back(&c);
+      DispersionTrials<DedispOutputType> lc_trials(filobj.get_tsamp());
+      DMDispenser lc_dispenser(lc_trials);
+      Worker lc_worker(lc_trials, lc_dispenser, acc_plan, args, size, 0, nullptr, keplerian_tb, false,
+                       window_starts, window_size, &window_acc_plan, 0);
+      for (auto& entry : by_dm) {
+        series->load(lc_trials, entry.first, entry.first + 1);
+        lc_worker.light_curves(0, entry.second);
+      }
+      std::cout << "Light curves of " << dm_cands.cands.size() << " candidates from " << by_dm.size()
+                << " DM trials" << std::endl;
+    } else if (!args.no_light_curves) {
+      std::cout << "No light curves: they need --series_file" << std::endl;
+    }
+    timers["windows"].stop();
+  }
+
   CandidateFileWriter cand_files(args.outdir);
   //cand_files.write_binary(dm_cands.cands,"candidates.peasoup");
 
@@ -884,7 +1192,12 @@ int main(int argc, char **argv)
   for (int device_idx=0;device_idx<nthreads;device_idx++)
     device_idxs.push_back(device_idx);
   stats.add_gpu_info(device_idxs);
-  stats.add_candidates(dm_cands.cands,cand_files.byte_mapping,filobj);
+  if (windowed) {
+    stats.add_windows(window_starts, window_size, window_hop);
+    stats.add_candidates(dm_cands.cands,cand_files.byte_mapping,filobj,&window_starts,window_size,size);
+  } else {
+    stats.add_candidates(dm_cands.cands,cand_files.byte_mapping,filobj);
+  }
   timers["total"].stop();
   stats.add_timing_info(timers);
 

@@ -102,6 +102,8 @@ public:
     search_options.append(XML::Element("size",args.size));
     search_options.append(XML::Element("dmfilename",args.dm_file));
     search_options.append(XML::Element("series_file",args.series_file));
+    search_options.append(XML::Element("windows",args.windows));
+    search_options.append(XML::Element("no_light_curves",args.no_light_curves));
     search_options.append(XML::Element("cdm",format_float_to_precision(args.cdm, 4)));
     search_options.append(XML::Element("dm_start",args.dm_start));
     search_options.append(XML::Element("dm_end",args.dm_end));
@@ -189,6 +191,20 @@ public:
     root.append(gpu_info);
   }
   
+  void add_windows(const std::vector<std::size_t>& starts, std::size_t nsamps, std::size_t hop){
+    XML::Element windows("windows");
+    windows.add_attribute("count", starts.size());
+    windows.append(XML::Element("nsamps", nsamps));
+    windows.append(XML::Element("hop", hop));
+    for (std::size_t ii = 0; ii < starts.size(); ii++) {
+        XML::Element window("window");
+        window.add_attribute("id", ii);
+        window.set_text(std::to_string(starts[ii]));
+        windows.append(window);
+    }
+    root.append(windows);
+  }
+
   void add_dm_list(std::vector<float>& dms){
     XML::Element dm_trials("dedispersion_trials");
     dm_trials.add_attribute("count", dms.size());
@@ -220,9 +236,13 @@ public:
     root.append(acc_trials);
   }
 
+  // With WINDOW_STARTS (--windows), each candidate also gets the span it is
+  // reported from, the windows it was found in and its light curve.
   void add_candidates(std::vector<Candidate>& candidates, 
                     const std::map<unsigned, long int>& byte_map, 
-                    SigprocFilterbank& f)
+                    SigprocFilterbank& f,
+                    const std::vector<std::size_t>* window_starts = nullptr,
+                    std::size_t window_nsamps = 0, std::size_t full_nsamps = 0)
 {
     XML::Element cands("candidates");
     constexpr double RAD2DEG = 180.0 / M_PI;
@@ -259,6 +279,22 @@ public:
         cand.append(XML::Element("ddm_count_ratio", cand_ref.ddm_count_ratio));
         cand.append(XML::Element("ddm_snr_ratio", cand_ref.ddm_snr_ratio));
         cand.append(XML::Element("nassoc", candidates[ii].count_assoc()));
+        if (window_starts) {
+            const int w = cand_ref.window;
+            cand.append(XML::Element("window", w));
+            cand.append(XML::Element("window_start", w < 0 ? std::size_t(0) : (*window_starts)[w]));
+            cand.append(XML::Element("window_nsamps", w < 0 ? full_nsamps : window_nsamps));
+            cand.append(XML::Element("in_full", cand_ref.in_full ? 1 : 0));
+            cand.append(XML::Element("n_windows", cand_ref.windows.size()));
+            std::stringstream wins, lc;
+            for (std::size_t k = 0; k < cand_ref.windows.size(); ++k)
+                wins << (k ? ";" : "") << cand_ref.windows[k];
+            for (std::size_t k = 0; k < cand_ref.window_snr.size(); ++k)
+                lc << (k ? ";" : "") << format_float_to_precision(cand_ref.window_snr[k], 2);
+            cand.append(XML::Element("windows", wins.str()));
+            cand.append(XML::Element("full_snr", format_float_to_precision(cand_ref.full_snr, 2)));
+            cand.append(XML::Element("window_snr", lc.str()));
+        }
         cands.append(cand);
     }
 

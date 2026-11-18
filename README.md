@@ -56,6 +56,21 @@
 
 * **Live Progress Bar**: Useful for multi-day or multi-week searches. Activate it with the `-p` flag.
 
+* **Windows (`--windows N:HOP`)**: Also searches every window of `N` samples (a power of two) that starts at a multiple of `HOP`, for sources that cross the beam during the observation, as in drift scans. Each DM trial is read once; the whole series and every window are searched from it, each window with its own red-noise removal and whitening. A window's candidates are distilled as the whole series' are; candidates of one signal in several windows (within two Fourier bins of a window, over neighbouring DM trials) become one, reported from its strongest window, and a window signal that the whole-series search also found joins that candidate, which is reported from the more significant of the two. Each candidate in `overview.xml` then has:
+
+  * `window`, `window_start`, `window_nsamps`: the span it is reported from (`window` -1 for the whole series);
+  * `in_full`: whether the whole-series search found it;
+  * `n_windows`, `windows`: the windows it was found in (indices separated by `;`);
+  * `full_snr`, `window_snr`: its light curve, the largest value of its harmonic sum within one Fourier bin of its frequency at its DM trial and acceleration, in the whole series and in each window (`;`-separated). A steady source is in every window at a level that falls with the window length; a source crossing the beam peaks in the windows that hold it; noise in one window shows nothing in the others. The light curves need `--series_file` (the rows are read again); `--no_light_curves` skips them.
+
+  The windows are listed in `<windows>`. Without `--windows` the output is unchanged. With `--series_file`, for example 33.6 s windows that overlap by half on 256 us data:
+
+  ```bash
+  peasoup -i obs.fil -o out --series_file obs.series --windows 131072:65536
+  ```
+
+  Fold a window's candidates over its own span, for example with PulsarX's `psrfold_fil --frac START END`, where `START` and `END` are `window_start` and `window_start + window_nsamps` as fractions of the file.
+
 ---
 
 ## Installation

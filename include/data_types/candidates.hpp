@@ -3,6 +3,7 @@
 #include <vector>
 #include <sstream>
 #include "stdio.h"
+#include <cmath>
 
 
 struct CandidatePOD {
@@ -45,6 +46,16 @@ public:
   std::vector<float> fold;
   int nbins;
   int nints;
+  // With --windows: the scale the candidate is reported from (-1 the whole
+  // series, else a window index), the windows the signal was found in,
+  // whether the whole-series search found it, and its light curve (S/N at
+  // its frequency, harmonic sum, DM trial and acceleration in the whole
+  // series and in each window; NaN where not measured).
+  int window = -1;
+  std::vector<int> windows;
+  bool in_full = true;
+  float full_snr = NAN;
+  std::vector<float> window_snr;
   
   void append(Candidate& other){
     assoc.push_back(other);
